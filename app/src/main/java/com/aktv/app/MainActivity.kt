@@ -73,7 +73,6 @@ class MainActivity : AppCompatActivity() {
     private var tab = 0; private var current = -1; private var retries = 0
     private var player: ExoPlayer? = null
     private var activeSources: List<String> = emptyList()
-    private var activeEmbed: String? = null
     private var sourceIndex = 0
     private var activeChannelId: String? = null
 
@@ -377,7 +376,7 @@ class MainActivity : AppCompatActivity() {
         infoCard.animate().alpha(1f).translationY(0f).setDuration(260).setInterpolator(DecelerateInterpolator(2f)).start()
         playerScrim.animate().alpha(1f).setDuration(260).start()
         playerClock.animate().alpha(1f).setDuration(260).start()
-        ui.postDelayed(hideInfo, 4000)
+        ui.postDelayed(hideInfo, 8000)
     }
     private fun bindInfo(ch: Channel) {
         infoName.text = ch.name
@@ -402,6 +401,9 @@ class MainActivity : AppCompatActivity() {
                     if (guideRequestChannel != ch.id || activeChannelId != ch.id || isFinishing) return@runOnUiThread
                     infoCat.text = if (nowTitle != null) "NOW  $nowTitle${if (nowTime != null) " · $nowTime" else ""}" else "${ch.category}   ${current + 1} of ${shown.size}"
                     infoHintView.text = if (nextTitle != null) "UP NEXT  $nextTitle${if (nextTime != null) " · $nextTime" else ""}" else "Programme information unavailable"
+                    // Guide data often arrives after the player overlay first opens;
+                    // bring the updated Now/Next information back into view.
+                    showInfo()
                 }
             } catch (_: Exception) {
                 runOnUiThread {
@@ -445,20 +447,52 @@ class MainActivity : AppCompatActivity() {
         val ch = shown[current]
         activeChannelId = ch.id
         activeSources = emptyList()
-        activeEmbed = "https://livetgtv.lovable.app/embed/${Uri.encode(ch.id)}"
+        // Native playback only: do not launch the website embed/WebView for channel playback.
         sourceIndex = 0
         bindInfo(ch)
-        spinner.visibility = View.GONE
+        spinner.visibility = View.VISIBLE
         releasePlayer()
+        pv.visibility = View.VISIBLE
+        guideShown = false
+        guide.visibility = View.GONE
 
-        // Prefer the broadcaster site's own embed player on TV. Some channels deliver
-        // audio successfully through native Media3 while their video/codec/DRM path fails;
-        // the site's embed handles its channel-specific player configuration and servers.
-        try {
-            startActivity(Intent(this, BrowserActivity::class.java).putExtra("url", activeEmbed))
-        } catch (e: Exception) {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            Toast.makeText(this, "Unable to open channel player: ${e.message ?: "unknown error"}", Toast.LENGTH_LONG).show()
+        // Resolve fresh signed manifest URLs and ClearKey metadata immediately before playback.
+        // The API returns short-lived URLs, so do not cache them between channel launches.
+        io.execute {
+            try {
+                val details = resolveChannel(ch.id)
+                val sourceArray = details.optJSONArray("sources")
+                val urls = mutableListOf<String>()
+                if (sourceArray != null) {
+                    for (i in 0 until sourceArray.length()) {
+                        val value = sourceArray.optString(i, "").trim()
+                        if (value.startsWith("https://") || value.startsWith("http://")) urls.add(value)
+                    }
+                }
+                // Tolerate providers that wrap sources in a nested object, without treating embed URLs as streams.
+                if (urls.isEmpty()) collectUrls(details.opt("sources"), urls)
+                val unique = urls.distinct()
+                val drm = details.optJSONObject("drm")
+                ui.post {
+                    if (activeChannelId != ch.id || isFinishing) return@post
+                    if (unique.isEmpty()) {
+                        spinner.visibility = View.GONE
+                        infoHintView.text = "No playable stream was returned for this channel."
+                        Toast.makeText(this, "No native stream available for ${ch.name}", Toast.LENGTH_LONG).show()
+                    } else {
+                        activeSources = unique
+                        sourceIndex = 0
+                        startSource(0, drm)
+                    }
+                }
+            } catch (e: Exception) {
+                ui.post {
+                    if (activeChannelId != ch.id || isFinishing) return@post
+                    spinner.visibility = View.GONE
+                    infoHintView.text = "Unable to resolve this channel's native stream. Check connection and retry."
+                    Toast.makeText(this, "Stream resolution failed for ${ch.name}: ${e.message ?: "network/API error"}", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -472,9 +506,8 @@ class MainActivity : AppCompatActivity() {
     private fun startSource(index: Int, drm: JSONObject?) {
         if (index !in activeSources.indices) {
             spinner.visibility = View.GONE
-            val embed = activeEmbed
-            if (!embed.isNullOrBlank() && embed.startsWith("http")) startActivity(Intent(this, BrowserActivity::class.java).putExtra("url", embed))
-            else Toast.makeText(this, "All available stream servers failed. Try another server or channel.", Toast.LENGTH_LONG).show()
+            infoHintView.text = "All native stream sources failed. Try this channel again later."
+            Toast.makeText(this, "All native stream sources failed. No website player was opened.", Toast.LENGTH_LONG).show()
             return
         }
         sourceIndex = index
@@ -509,9 +542,8 @@ class MainActivity : AppCompatActivity() {
                     spinner.visibility = View.GONE
                     val c = e.cause
                     val extra = if (c is HttpDataSource.InvalidResponseCodeException) " HTTP ${c.responseCode}" else ""
-                    val embed = activeEmbed
-                    if (!embed.isNullOrBlank() && embed.startsWith("http")) startActivity(Intent(this@MainActivity, BrowserActivity::class.java).putExtra("url", embed))
-                    else Toast.makeText(this@MainActivity, "Playback error: ${e.errorCodeName}$extra", Toast.LENGTH_LONG).show()
+                    infoHintView.text = "Playback failed (${e.errorCodeName}). Try another source or channel."
+                    Toast.makeText(this@MainActivity, "Native playback error: ${e.errorCodeName}$extra", Toast.LENGTH_LONG).show()
                 }
             }
         })
