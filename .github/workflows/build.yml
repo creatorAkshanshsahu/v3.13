@@ -22,3 +22,4 @@ jobs:
         with:
           name: AK-TV-apks
           path: out/*.apk
+
